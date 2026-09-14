@@ -1,0 +1,179 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Lesyria - stack complete (Paper + plugin Lesyria + PostgreSQL)
+#
+#  UN SEUL FICHIER, DEUX PROFILS :
+#
+#      cp .env.example .env
+#      docker compose --profile prod up -d     # production
+#      docker compose --profile dev  up -d     # developpement
+#
+#  ou via le Makefile :
+#
+#      make up                  # profil dev
+#      make up PROFILE=prod     # profil production
+#
+#  Les deux profils utilisent des volumes et des ports DIFFERENTS : ils peuvent
+#  tourner en parallele et les donnees de developpement (mode hors ligne, UUID
+#  derives du pseudo) ne polluent jamais la production.
+#
+#          service           profil   base            monde                   Java   API    RCON
+#          postgres          prod     postgres-data   -                       5432*   -      -
+#          minecraft         prod     postgres-data   minecraft-data          25565  8080   25575
+#          postgres-dev      dev      postgres-dev-data -                     55432*  -      -
+#          minecraft-dev     dev      postgres-dev-data minecraft-dev-data     25566  8081   25576
+#
+#          (*) publiees sur 127.0.0.1 uniquement, jamais sur le reseau public
+#
+#  PostgreSQL n'est jamais joignable depuis l'exterieur : chaque serveur
+#  Minecraft y accede par le reseau Docker interne.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: lesyria
+
+# ─── Fragments partages (ancres YAML) ─────────────────────────────────────────
+
+x-postgres-common: &postgres-common
+  image: postgres:17-alpine
+  restart: unless-stopped
+  environment:
+    POSTGRES_DB: ${POSTGRES_DB:-lesyria}
+    POSTGRES_USER: ${POSTGRES_USER:-lesyria}
+    # Aucun mot de passe par defaut : il est obligatoire (voir .env.example)
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Definissez POSTGRES_PASSWORD dans .env (voir .env.example)}
+    POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+  expose:
+    - "5432"
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 20s
+  networks:
+    - lesyria
+
+x-minecraft-common: &minecraft-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      PAPER_VERSION: ${MC_VERSION:-26.2}
+      PAPER_BUILD: ${PAPER_BUILD:-123}
+      PAPER_SHA256: ${PAPER_SHA256:-7b7b3b43c009103e1971a0576c26f655a7dd9b56a0a2a4438e352c03a7fecd08}
+  image: lesyria/minecraft:${APP_IMAGE_TAG:-beta}
+  restart: unless-stopped
+  # Laisse au serveur le temps de sauvegarder les mondes a l'arret
+  stop_grace_period: 90s
+  stdin_open: true
+  tty: true
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/status >/dev/null || exit 1"]
+    interval: 30s
+    timeout: 5s
+    retries: 5
+    start_period: 300s
+  networks:
+    - lesyria
+
+# Reglages Minecraft communs aux deux profils
+x-minecraft-environment: &minecraft-environment
+  EULA: ${EULA:-false}
+  MEMORY: ${MEMORY:-2G}
+  SERVER_PORT: "25565"
+  MOTD: ${MOTD:-Lesyria - beta}
+  MAX_PLAYERS: ${MAX_PLAYERS:-100}
+  DIFFICULTY: ${DIFFICULTY:-normal}
+  GAMEMODE: ${GAMEMODE:-survival}
+  LEVEL_NAME: ${LEVEL_NAME:-world}
+  LEVEL_TYPE: ${LEVEL_TYPE:-minecraft:normal}
+  LEVEL_SEED: ${LEVEL_SEED:-}
+  SPAWN_PROTECTION: ${SPAWN_PROTECTION:-0}
+  ENABLE_RCON: "true"
+  RCON_PORT: "25575"
+  RCON_PASSWORD: ${RCON_PASSWORD:?Definissez RCON_PASSWORD dans .env (voir .env.example)}
+  TZ: ${TZ:-Europe/Paris}
+  LESYRIA_API_ENABLED: ${API_ENABLED:-true}
+  LESYRIA_API_PORT: "8080"
+
+services:
+
+  # ─── PostgreSQL (production) ────────────────────────────────────────────────
+  postgres:
+    <<: *postgres-common
+    profiles: ["prod"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Boucle locale uniquement : utile pour psql/pg_dump depuis l'hote,
+      # jamais accessible depuis Internet.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+  # ─── PostgreSQL (developpement) ─────────────────────────────────────────────
+  postgres-dev:
+    <<: *postgres-common
+    profiles: ["dev"]
+    volumes:
+      - postgres-dev-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_DEV_PORT:-55432}:5432"
+
+  # ─── Serveur Minecraft (production) ─────────────────────────────────────────
+  minecraft:
+    <<: *minecraft-common
+    profiles: ["prod"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *minecraft-environment
+      # Mode en ligne : les UUID proviennent de Mojang (aucune usurpation)
+      ONLINE_MODE: ${ONLINE_MODE:-true}
+      VIEW_DISTANCE: ${VIEW_DISTANCE:-8}
+      SIMULATION_DISTANCE: ${SIMULATION_DISTANCE:-6}
+      LESYRIA_API_BIND: ${API_BIND:-127.0.0.1}
+      # Par defaut, l'URL est calculee pour le service `postgres`
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-lesyria}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lesyria}}
+    ports:
+      - "${SERVER_PORT:-25565}:25565"
+      # Port Bedrock reserve a un futur proxy Geyser (non active en beta)
+      # - "${BEDROCK_PORT:-19132}:19132/udp"
+      - "${RCON_PORT:-25575}:25575"
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8080}:8080"
+    volumes:
+      # Monde, plugins, logs et configurations : persistent
+      - minecraft-data:/server
+
+  # ─── Serveur Minecraft (developpement) ──────────────────────────────────────
+  minecraft-dev:
+    <<: *minecraft-common
+    profiles: ["dev"]
+    depends_on:
+      postgres-dev:
+        condition: service_healthy
+    environment:
+      <<: *minecraft-environment
+      # Mode hors ligne : permet de tester plusieurs joueurs sans comptes Mojang
+      ONLINE_MODE: ${ONLINE_MODE_DEV:-false}
+      VIEW_DISTANCE: ${VIEW_DISTANCE_DEV:-6}
+      SIMULATION_DISTANCE: ${SIMULATION_DISTANCE_DEV:-4}
+      # En dev, l'API ecoute partout (consommee par le launcher et l'outillage)
+      LESYRIA_API_BIND: ${API_BIND_DEV:-0.0.0.0}
+      DATABASE_URL: ${DATABASE_URL_DEV:-postgresql://${POSTGRES_USER:-lesyria}:${POSTGRES_PASSWORD}@postgres-dev:5432/${POSTGRES_DB:-lesyria}}
+    ports:
+      - "${SERVER_DEV_PORT:-25566}:25565"
+      - "${RCON_DEV_PORT:-25576}:25575"
+      - "${API_DEV_PORT:-8081}:8080"
+    volumes:
+      - minecraft-dev-data:/server
+      # Le plugin vient du poste de developpement : `make build` puis redemarrage
+      - ./target/lesyria.jar:/opt/lesyria/lesyria.jar:ro
+
+volumes:
+  postgres-data:
+  postgres-dev-data:
+  minecraft-data:
+  minecraft-dev-data:
+
+networks:
+  lesyria:
+    driver: bridge

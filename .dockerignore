@@ -1,0 +1,15 @@
+# Le contexte de build n'a besoin que des sources, de Maven et du plugin.
+.git
+.gitignore
+.github
+target
+.m2
+volumes
+*.md
+docs
+.env
+.env.*
+LICENSE
+SECURITY.md
+Makefile
+docker-compose*.yml
